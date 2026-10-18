@@ -1,0 +1,298 @@
+BOT G
+# player_template.py
+"""
+Simplified PokerBot – Player Template
+
+You ONLY need to modify the `decide_action` function below.
+
+The tournament engine (master.py) will:
+  - Call this script once per round.
+  - Send you a single JSON object on stdin describing the game state.
+  - Expect a JSON object on stdout: {"action": "FOLD" or "CALL" or "RAISE"}
+
+Your job:
+  - Read the state.
+  - Decide whether to FOLD / CALL / RAISE using a *quantitative* strategy.
+  - Output the action as JSON.
+
+You are free to:
+  - Add helper functions.
+  - Use probability / EV calculations.
+  - Use opponent statistics for adaptive strategies.
+  - As long as you keep the I/O format the same.
+"""
+
+import json
+import sys
+from typing import List, Tuple
+
+# -------------------------
+# 1. Basic card utilities
+# -------------------------
+
+# Ranks from lowest to highest. T = 10, J = Jack, Q = Queen, K = King, A = Ace.
+RANKS = "23456789TJQKA"
+# Map rank character -> numeric value (2..14)
+RANK_VALUE = {r: i + 2 for i, r in enumerate(RANKS)}  # 2..14 (A=14)
+
+
+def parse_card(card_str: str) -> Tuple[int, str]:
+    """
+    Convert a string like "AH" or "7D" into (rank_value, suit).
+
+    Example:
+        "AH" -> (14, 'H')
+        "7D" -> (7, 'D')
+
+    card_str[0]: rank in "23456789TJQKA"
+    card_str[1]: suit in "CDHS"  (Clubs, Diamonds, Hearts, Spades)
+    """
+    return RANK_VALUE[card_str[0]], card_str[1]
+
+
+def is_straight_3(rank_values: List[int]) -> Tuple[bool, int]:
+    """
+    Check if 3 cards form a straight under our custom rules.
+
+    Rules:
+      - 3 cards are a straight if they are in sequence.
+      - A can be:
+          * LOW in A-2-3  (treated as the LOWEST straight)
+          * HIGH in Q-K-A (treated as the highest normal case)
+      - Return:
+          (is_straight: bool, high_card_value_for_straight: int)
+
+    Examples:
+      [2, 3, 4]    -> (True, 4)
+      [12, 13, 14] -> Q-K-A -> (True, 14)
+      [14, 2, 3]   -> A-2-3 -> (True, 3)  (lowest straight)
+    """
+    r = sorted(rank_values)
+
+    # Normal consecutive: x, x+1, x+2
+    if r[0] + 1 == r[1] and r[1] + 1 == r[2]:
+        return True, r[2]
+
+    # A-2-3 special: {14,2,3} -> treat as straight with high=3
+    if set(r) == {14, 2, 3}:
+        return True, 3
+
+    return False, 0
+
+
+# --------------------------------------
+# 2. Hand category evaluation (3 cards)
+# --------------------------------------
+
+"""
+Hand is always: your 2 hole cards + 1 community card = 3 cards.
+
+We classify them into 6 categories (from weakest to strongest):
+
+  0: HIGH CARD
+  1: PAIR
+  2: FLUSH
+  3: STRAIGHT
+  4: TRIPS  (Three of a kind)
+  5: STRAIGHT FLUSH
+
+And the *global ranking* is:
+
+  STRAIGHT_FLUSH (5) > TRIPS (4) > STRAIGHT (3) > FLUSH (2) > PAIR (1) > HIGH_CARD (0)
+
+This function only returns the category index 0..5,
+not the tie-break details (you don't strictly need tie-breaks inside your bot).
+"""
+
+
+def hand_category(hole: List[str], table: str) -> int:
+    """
+    Compute the hand category for your 3-card hand.
+
+    Input:
+        hole  = ["AS", "TD"], etc. (your two private cards)
+        table = "7H"           (community card)
+
+    Returns:
+        0..5 as defined above.
+    """
+    cards = hole + [table]
+    rank_values, suits = zip(*[parse_card(c) for c in cards])
+    flush = len(set(suits)) == 1  # True if all 3 suits are the same
+
+    # Count how many times each rank appears
+    counts = {}
+    for v in rank_values:
+        counts[v] = counts.get(v, 0) + 1
+
+    straight, _ = is_straight_3(list(rank_values))
+
+    if straight and flush:
+        return 5  # Straight Flush
+    if 3 in counts.values():
+        return 4  # Trips
+    if straight:
+        return 3  # Straight
+    if flush:
+        return 2  # Flush
+    if 2 in counts.values():
+        return 1  # Pair
+    return 0      # High Card
+
+
+# ----------------------------------------
+# 3. Scoring summary (for your reference)
+# ----------------------------------------
+"""
+IMPORTANT: these are the points awarded PER ROUND
+depending on the actions and showdown result.
+
+Notation:
+  - "Showdown" means nobody folded: cards are compared.
+  - result = which player wins the hand, not part of your code directly.
+
+Fold scenarios (no showdown):
+  P1: FOLD, P2: FOLD  ->  (0, 0)
+  P1: FOLD, P2: CALL  ->  (-1, +2)
+  P1: FOLD, P2: RAISE ->  (-1, +3)
+  P1: CALL, P2: FOLD  ->  (+2, -1)
+  P1: RAISE, P2: FOLD ->  (+3, -1)
+
+Showdown scenarios (someone has better hand):
+  Both CALL:
+    - P1 wins: (+2, -2)
+    - P2 wins: (-2, +2)
+
+  P1 RAISE, P2 CALL:
+    - P1 wins: (+3, -2)
+    - P2 wins: (-3, +2)
+
+  P1 CALL, P2 RAISE:
+    - P1 wins: (+2, -3)
+    - P2 wins: (-2, +3)
+
+  P1 RAISE, P2 RAISE (High-Risk round):
+    - P1 wins: (+3, -3)
+    - P2 wins: (-3, +3)
+
+Any showdown where hands are *exactly* identical:
+  -> (0, 0)
+
+Your bot does NOT see the opponent's current action,
+but it CAN see opponent action frequencies over previous rounds
+(via `opponent_stats`).
+Use this to think in terms of EXPECTED VALUE (EV), not just raw hand strength.
+"""
+
+
+# -----------------------------------
+# 4. Main strategy function to edit
+# -----------------------------------
+
+import itertools
+import random
+
+def decide_action(state: dict) -> str:
+    """
+    Mixed-strategy EV-based bot using predefined action frequencies
+    for weak / medium / strong hands.
+    """
+
+    # ---------- State ----------
+    hole_cards = state["your_hole"]
+    community_card = state["table_card"]
+    my_pts = state.get("your_points", 0)
+    opp_pts = state.get("opponent_points", 0)
+
+    my_hand = hole_cards + [community_card]
+
+    # ---------- Win Probability ----------
+    win_prob = calculate_win_probability(my_hand, community_card)
+
+    # ---------- EVs ----------
+    ev_call = (win_prob * 2) + ((1 - win_prob) * -2)
+    ev_raise = (win_prob * 3) + ((1 - win_prob) * -3)
+    ev_fold = -1
+
+    # ---------- Hand Strength Buckets ----------
+    # Weak: < 40%
+    # Medium: 40% – 65%
+    # Strong: > 65%
+
+    r = random.random()  # 0.0 – 1.0
+
+    # ---------------- WEAK HANDS ----------------
+    if win_prob < 0.40:
+        # FOLD: 80–90%
+        # CALL: 10–20%
+        # RAISE: ~0%
+        if r < 0.85:
+            return "FOLD"
+        else:
+            return "CALL"
+
+    # -------------- MEDIUM HANDS ---------------
+    if 0.40 <= win_prob <= 0.65:
+        # FOLD: 30–40%
+        # CALL: 40–50%
+        # RAISE: 15–25%
+        if r < 0.35:
+            return "FOLD"
+        elif r < 0.80:
+            return "CALL"
+        else:
+            # Only raise if EV supports it
+            if ev_raise >= ev_call:
+                return "RAISE"
+            return "CALL"
+
+    # --------------- STRONG HANDS ---------------
+    # win_prob > 65%
+    # FOLD: ~0%
+    # CALL: 20–30%
+    # RAISE: 70–80%
+    if r < 0.75:
+        return "RAISE"
+    else:
+        return "CALL"
+
+
+def get_best_ev_action(ev_call, ev_raise, ev_fold):
+    """Fallback EV selector (kept for safety)."""
+    choices = {
+        "RAISE": ev_raise,
+        "CALL": ev_call,
+        "FOLD": ev_fold
+    }
+    return max(choices, key=choices.get)
+
+# -----------------------------
+# 5. I/O glue (do not touch)
+# -----------------------------
+
+def main():
+    """
+    DO NOT modify this unless you know what you're doing.
+
+    It:
+      - Reads one JSON object from stdin.
+      - Calls decide_action(state).
+      - Writes {"action": "..."} as JSON to stdout.
+    """
+    raw = sys.stdin.read().strip()
+    try:
+        state = json.loads(raw) if raw else {}
+    except Exception:
+        state = {}
+
+    action = decide_action(state)
+
+    # Safety check: default to CALL if something invalid is returned
+    if action not in {"FOLD", "CALL", "RAISE"}:
+        action = "CALL"
+
+    sys.stdout.write(json.dumps({"action": action}))
+
+
+if __name__ == "__main__":
+    main()
